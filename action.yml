@@ -1,0 +1,178 @@
+name: "auto-release"
+description: "Automatically draft release notes for your next release as Pull Requests are merged into main. Optionally, automatically publish a release for every Pull Request."
+inputs:
+  token:
+    description: "Standard GitHub token (e.g., secrets.GITHUB_TOKEN)"
+    required: false
+    default: ${{ github.token }}
+  publish:
+    description: "Whether to publish a new release immediately"
+    required: false
+    default: "false"
+  prerelease:
+    description: "Boolean indicating whether this release should be a prerelease"
+    required: false
+    default: ""
+  latest:
+    description: |
+      A string indicating whether the release being created or updated should be marked as latest.
+    required: false
+    default: ''
+  summary-enabled:
+    description: Enable github action summary.
+    required: false
+    default: 'true'
+  config-name:
+    description: |
+      If your workflow requires multiple release-drafter configs it is helpful to override the config-name.
+      The config should still be located inside `.github` as that's where we are looking for config files.
+    required: false
+    default: 'configs/draft-release.yml'
+
+outputs:
+  id:
+    description: The ID of therelease that was created or updated.
+    value: ${{ steps.release.outputs.id }}
+  name:
+    description: The name of the release
+    value: ${{ steps.release.outputs.name }}
+  tag_name:
+    description: The name of the tag associated with the release.
+    value: ${{ steps.release.outputs.tag_name }}
+  body:
+    description: The body of the drafted release.
+    value: ${{ steps.release.outputs.body }}
+  html_url:
+    description: The URL users can navigate to in order to view the release
+    value: ${{ steps.release.outputs.html_url }}
+  upload_url:
+    description: The URL for uploading assets to the release, which could be used by GitHub Actions for additional uses, for example the @actions/upload-release-asset GitHub Action.
+    value: ${{ steps.release.outputs.upload_url }}
+  major_version:
+    description: The next major version number. For example, if the last tag or release was v1.2.3, the value would be v2.0.0.
+    value: ${{ steps.release.outputs.major_version }}
+  minor_version:
+    description: The next minor version number. For example, if the last tag or release was v1.2.3, the value would be v1.3.0.
+    value: ${{ steps.release.outputs.minor_version }}
+  patch_version:
+    description: The next patch version number. For example, if the last tag or release was v1.2.3, the value would be v1.2.4.
+    value: ${{ steps.release.outputs.patch_version }}
+  resolved_version:
+    description: The next resolved version number, based on GitHub labels.
+    value: ${{ steps.release.outputs.resolved_version }}
+  exists:
+    description: Tag exists so skip new release issue
+    value: ${{ steps.has-duplicate.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        token: ${{ inputs.token }}
+        fetch-tags: true
+
+    - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      name: Get PR labels
+      id: pr-info
+      with:
+        retries: 3
+        github-token: ${{ inputs.token }}
+        script: |
+          const repository = context.repo;
+          const sha = context.sha;
+          
+          const resp = await github.rest.pulls.list({
+            ...repository,
+            sort: 'updated',
+            direction: 'desc',
+            state: 'closed',
+            per_page: 100
+          });
+          
+          const pull = resp.data.find(p => p.merge_commit_sha === sha);
+          if (pull) {            
+            return {
+              number: pull.number,
+              labels: pull.labels.map(l => l.name).join('\n')
+            };
+          };
+          
+          return {};
+
+    - name: Tags
+      shell: bash
+      id: tags
+      run: |
+        git fetch --tags
+        tags=$(git tag --contains ${{ github.sha }} | jq -R --slurp  '. | sub("\n"; " "; "g") | rtrimstr(" ")')
+        echo "value=${tags}" >> $GITHUB_OUTPUT
+
+    - name: Check for duplicates
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      id: has-duplicate
+      with:
+        retries: 3
+        github-token: ${{ inputs.token }}
+        result-encoding: string
+        script: |
+          const repository = context.repo;
+          const sha = context.sha;
+
+          const tags = ${{ steps.tags.outputs.value }}.split(" ");
+
+          for (const tag of tags) {
+            if (tag == "") {
+              continue;
+            }
+            console.log("Getting: " + tag);
+            const release = await github.rest.repos.getReleaseByTag({
+              ...repository,
+              tag,
+            }).catch(function(error) {
+              if (error.status === 404) {
+                core.info(`Release v${VERSION} not found`)
+                return
+              } else {
+                throw error
+              }
+            });
+            if ( release && ! release.data.draft && release.data.prerelease == ${{ inputs.prerelease }} ) {
+              console.log("Found release: " + tag);
+              return true;
+            }
+          }
+          console.log("No release found");
+          return false;
+
+    # Drafts the next Release and compiles the notes as Pull Requests are merged into "main" (unless the `no-release` label is used on the PR)
+    - uses: release-drafter/release-drafter@34d80673e067bdc0c24568d3af899c216adcfaa9 # v7.7.0
+      name: Draft release
+      id: release
+      if: steps.has-duplicate.outputs.result == 'false'
+      with:
+        token: ${{ inputs.token }}
+        publish: ${{ inputs.publish == 'true' && !contains(fromJson(steps.pr-info.outputs.result).labels, 'no-release')}}
+        prerelease: ${{ (inputs.prerelease != '' && inputs.prerelease) || contains(fromJson(steps.pr-info.outputs.result).labels, 'prerelease') }}
+        latest: ${{ inputs.latest }}
+        config-name: ${{ inputs.config-name }}
+        commitish: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+
+    # Workaround for https://github.com/release-drafter/release-drafter/issues/1313
+    - name: Release Summary
+      if: ${{ steps.has-duplicate.outputs.result == 'false' && inputs.summary-enabled == 'true' }}
+      shell: bash
+      env:
+        RELEASE_BODY: |-
+          ${{ steps.release.outputs.body }}
+      run: |
+        echo 'Checking to make sure release id is not empty: "${{ steps.release.outputs.id }}"'
+        ! test -z "${{ steps.release.outputs.id }}"
+        echo '## ${{ steps.release.outputs.id }} (${{ steps.release.outputs.tag_name }})' >> $GITHUB_STEP_SUMMARY
+        cat > ${GITHUB_STEP_SUMMARY} <<- EOM
+          ${RELEASE_BODY}
+        EOM
+        echo '[View Release](${{ steps.release.outputs.html_url }})' >> $GITHUB_STEP_SUMMARY
