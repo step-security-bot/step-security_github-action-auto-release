@@ -75,7 +75,7 @@ jobs:
 | body | The body of the drafted release. |
 | exists | Tag exists so skip new release issue |
 | html\_url | The URL users can navigate to in order to view the release |
-| id | The ID of therelease that was created or updated. |
+| id | The ID of the release that was created or updated. |
 | major\_version | The next major version number. For example, if the last tag or release was v1.2.3, the value would be v2.0.0. |
 | minor\_version | The next minor version number. For example, if the last tag or release was v1.2.3, the value would be v1.3.0. |
 | name | The name of the release |
