@@ -96,6 +96,7 @@ For 🐛 bug reports & feature requests, please use the [issue tracker](https://
 <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=for-the-badge" alt="License"></a>
 
 Copyright © 2022-2026 [Cloud Posse, LLC](https://cloudposse.com)
+
 Copyright 2026 StepSecurity
 
 
