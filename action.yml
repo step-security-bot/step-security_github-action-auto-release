@@ -1,0 +1,224 @@
+name: "auto-release"
+description: "Automatically draft release notes for your next release as Pull Requests are merged into main. Optionally, automatically publish a release for every Pull Request."
+inputs:
+  token:
+    description: "Standard GitHub token (e.g., secrets.GITHUB_TOKEN)"
+    required: false
+    default: ${{ github.token }}
+  publish:
+    description: "Whether to publish a new release immediately"
+    required: false
+    default: "false"
+  prerelease:
+    description: "Boolean indicating whether this release should be a prerelease"
+    required: false
+    default: ""
+  latest:
+    description: |
+      A string indicating whether the release being created or updated should be marked as latest.
+    required: false
+    default: ''
+  summary-enabled:
+    description: Enable github action summary.
+    required: false
+    default: 'true'
+  config-name:
+    description: |
+      If your workflow requires multiple release-drafter configs it is helpful to override the config-name.
+      The config should still be located inside `.github` as that's where we are looking for config files.
+    required: false
+    default: 'configs/draft-release.yml'
+
+outputs:
+  id:
+    description: The ID of the release that was created or updated.
+    value: ${{ steps.release.outputs.id }}
+  name:
+    description: The name of the release
+    value: ${{ steps.release.outputs.name }}
+  tag_name:
+    description: The name of the tag associated with the release.
+    value: ${{ steps.release.outputs.tag_name }}
+  body:
+    description: The body of the drafted release.
+    value: ${{ steps.release.outputs.body }}
+  html_url:
+    description: The URL users can navigate to in order to view the release
+    value: ${{ steps.release.outputs.html_url }}
+  upload_url:
+    description: The URL for uploading assets to the release, which could be used by GitHub Actions for additional uses, for example the @actions/upload-release-asset GitHub Action.
+    value: ${{ steps.release.outputs.upload_url }}
+  major_version:
+    description: The next major version number. For example, if the last tag or release was v1.2.3, the value would be v2.0.0.
+    value: ${{ steps.release.outputs.major_version }}
+  minor_version:
+    description: The next minor version number. For example, if the last tag or release was v1.2.3, the value would be v1.3.0.
+    value: ${{ steps.release.outputs.minor_version }}
+  patch_version:
+    description: The next patch version number. For example, if the last tag or release was v1.2.3, the value would be v1.2.4.
+    value: ${{ steps.release.outputs.patch_version }}
+  resolved_version:
+    description: The next resolved version number, based on GitHub labels.
+    value: ${{ steps.release.outputs.resolved_version }}
+  exists:
+    description: Tag exists so skip new release issue
+    value: ${{ steps.has-duplicate.outputs.result }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Subscription check
+      env:
+        REPO_PRIVATE: ${{ github.event.repository.private }}
+      run: |
+        # validate subscription status
+        UPSTREAM="cloudposse/github-action-auto-release"
+        ACTION_REPO="${GITHUB_ACTION_REPOSITORY:-}"
+        DOCS_URL="https://docs.stepsecurity.io/actions/stepsecurity-maintained-actions"
+
+        echo ""
+        echo -e "\033[1;36mStepSecurity Maintained Action\033[0m"
+        echo "Secure drop-in replacement for $UPSTREAM"
+        if [ "$REPO_PRIVATE" = "false" ]; then
+          echo -e "\033[32m✓ Free for public repositories\033[0m"
+        fi
+        echo -e "\033[36mLearn more:\033[0m $DOCS_URL"
+        echo ""
+
+        if [ "$REPO_PRIVATE" != "false" ]; then
+          SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"
+
+          if [ "$SERVER_URL" != "https://github.com" ]; then
+            BODY=$(printf '{"action":"%s","ghes_server":"%s"}' "$ACTION_REPO" "$SERVER_URL")
+          else
+            BODY=$(printf '{"action":"%s"}' "$ACTION_REPO")
+          fi
+
+          API_URL="https://agent.api.stepsecurity.io/v1/github/$GITHUB_REPOSITORY/actions/maintained-actions-subscription"
+
+          RESPONSE=$(curl --max-time 3 -s -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "$API_URL" -o /dev/null) && CURL_EXIT_CODE=0 || CURL_EXIT_CODE=$?
+
+          if [ $CURL_EXIT_CODE -ne 0 ]; then
+            echo "Timeout or API not reachable. Continuing to next step."
+          elif [ "$RESPONSE" = "403" ]; then
+            echo -e "::error::\033[1;31mThis action requires a StepSecurity subscription for private repositories.\033[0m"
+            echo -e "::error::\033[31mLearn how to enable a subscription: $DOCS_URL\033[0m"
+            exit 1
+          fi
+        fi
+      shell: bash
+    - name: Checkout commit
+      uses: actions/checkout@v7
+      with:
+        token: ${{ inputs.token }}
+        fetch-tags: true
+
+    - uses: actions/github-script@v9
+      name: Get PR labels
+      id: pr-info
+      with:
+        retries: 3
+        github-token: ${{ inputs.token }}
+        script: |
+          const repository = context.repo;
+          const sha = context.sha;
+          
+          const resp = await github.rest.pulls.list({
+            ...repository,
+            sort: 'updated',
+            direction: 'desc',
+            state: 'closed',
+            per_page: 100
+          });
+          
+          const pull = resp.data.find(p => p.merge_commit_sha === sha);
+          if (pull) {            
+            return {
+              number: pull.number,
+              labels: pull.labels.map(l => l.name).join('\n')
+            };
+          };
+          
+          return {};
+
+    - name: Tags
+      shell: bash
+      id: tags
+      run: |
+        git fetch --tags
+        tags=$(git tag --contains ${{ github.sha }} | jq -R --slurp  '. | sub("\n"; " "; "g") | rtrimstr(" ")')
+        echo "value=${tags}" >> $GITHUB_OUTPUT
+
+    - name: Check for duplicates
+      uses: actions/github-script@v9
+      id: has-duplicate
+      with:
+        retries: 3
+        github-token: ${{ inputs.token }}
+        result-encoding: string
+        script: |
+          const repository = context.repo;
+          const sha = context.sha;
+
+          const tags = ${{ steps.tags.outputs.value }}.split(" ");
+
+          for (const tag of tags) {
+            if (tag == "") {
+              continue;
+            }
+            console.log("Getting: " + tag);
+            const release = await github.rest.repos.getReleaseByTag({
+              ...repository,
+              tag,
+            }).catch(function(error) {
+              if (error.status === 404) {
+                core.info(`Release v${VERSION} not found`)
+                return
+              } else {
+                throw error
+              }
+            });
+            if ( release && ! release.data.draft && release.data.prerelease == ${{ inputs.prerelease }} ) {
+              console.log("Found release: " + tag);
+              return true;
+            }
+          }
+          console.log("No release found");
+          return false;
+
+    # Drafts the next Release and compiles the notes as Pull Requests are merged into "main" (unless the `no-release` label is used on the PR)
+    - uses: step-security/release-drafter@v7
+      name: Draft release
+      id: release
+      if: steps.has-duplicate.outputs.result == 'false'
+      with:
+        token: ${{ inputs.token }}
+        publish: ${{ inputs.publish == 'true' && !contains(fromJson(steps.pr-info.outputs.result).labels, 'no-release')}}
+        prerelease: ${{ (inputs.prerelease != '' && inputs.prerelease) || contains(fromJson(steps.pr-info.outputs.result).labels, 'prerelease') }}
+        latest: ${{ inputs.latest }}
+        config-name: ${{ inputs.config-name }}
+        commitish: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+
+    - name: Release Summary
+      if: ${{ steps.has-duplicate.outputs.result == 'false' && inputs.summary-enabled == 'true' }}
+      shell: bash
+      env:
+        RELEASE_ID: ${{ steps.release.outputs.id }}
+        RELEASE_TAG_NAME: ${{ steps.release.outputs.tag_name }}
+        RELEASE_HTML_URL: ${{ steps.release.outputs.html_url }}
+        RELEASE_BODY: |-
+          ${{ steps.release.outputs.body }}
+      run: |
+        echo "Checking to make sure release id is not empty: \"${RELEASE_ID}\""
+        ! test -z "${RELEASE_ID}"
+        echo "## ${RELEASE_ID} (${RELEASE_TAG_NAME})" >> $GITHUB_STEP_SUMMARY
+        cat > ${GITHUB_STEP_SUMMARY} <<- EOM
+          ${RELEASE_BODY}
+        EOM
+        echo "[View Release](${RELEASE_HTML_URL})" >> $GITHUB_STEP_SUMMARY
